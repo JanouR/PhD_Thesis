@@ -1,0 +1,537 @@
+---
+title: "WGCNA of age, sex, and diagnosis interactions"
+author: "Janou Roubroeks"
+date:  "`r format(Sys.time(), '%d %B %Y')`"
+output: 
+ html_document:
+  toc: true
+  toc_float: false
+  number_sections: false
+---
+
+ ```{css, echo=FALSE}
+    body .main-container {
+      max-width: 1800px !important;
+      margin-left: auto !important;
+      margin-right: auto !important;
+    }
+    body {
+      max-width: 1800px !important;
+      margin-left: auto !important;
+      margin-right: auto !important;
+    }
+    ```
+
+Overview of results for WGCNA associations of sex, age, sex x age, sex x diagnosis, and age x diagnosis to modules.
+The modules were previously generated (also used in the Chapter 3 analysis of WGCNA for diagnosis and other traits).
+
+An ANOVA interaction model was run on the module eigengenes as follows:
+
+
+```{r model, eval=FALSE}
+lm(MEs ~ sex + age + diagnosis + age * sex + diagnosis * sex + age * diagnosis)
+```
+
+Below is a heatmap showing the associations between the modules and traits of interest. The top value indicates the ANOVA F-statistic, and the p-value is shown in parentheses.
+
+``` {r load, include=FALSE,echo=FALSE, warning=FALSE,message=FALSE}
+
+
+setwd("")
+packages<-c("wateRmelon", "WGCNA", "clusterProfiler", "KEGGREST", "kableExtra")
+lapply(packages, library, character.only=T)
+options(stringsAsFactors = FALSE)
+
+
+######## Data preparation ########
+# Data needed: WGCNA modules object, filtered methylation data used to create modules,
+# full methylation data and phenotype file, data corrected for covariates, and 450K annotation file
+
+load("/") # modules
+load("") # filtered data (dat), used to create modules
+load("") # full data
+load("") # data corrected for covariates
+Anno<-read.csv("")
+Anno<-Anno[match(colnames(dat), Anno$Name),]
+
+data.dasen.regr<-RegData
+rm(RegData)
+
+# Check that all files are in the correct order
+# identical(rownames(pheno), rownames(dat))
+# identical(colnames(data.dasen.regr), rownames(dat))
+
+# Create a folder for storing output plots
+if(!dir.exists(paste0(getwd(),"/Plots"))){
+  dir.create(paste0(getwd(),"/Plots"))
+}
+if(!dir.exists(paste0(getwd(),"/Pathways"))){
+  dir.create(paste0(getwd(),"/Pathways"))
+}
+```
+  
+``` {r plot, echo=FALSE, warning=FALSE,message=FALSE}
+#### 1. Assign colours and calculate module eigengenes (MEs) ####
+
+moduleColors = labels2colors(bwnet.fcx$colors)
+
+MEs = moduleEigengenes(dat, moduleColors)$eigengenes
+MEs = orderMEs(MEs)
+
+# Disregard grey module from analysis, as it only contains probes that do not fit into any module
+MEs<- MEs[,c(colnames(MEs)!="MEgrey")]
+
+
+#### 2. Create Traits data ####
+
+# Select only traits of interest (sex, age, and diagnosis in this case)
+Traits<- pheno[ , c('Sex', "Age_At_Visit", "AtVisit_Group3")]
+Traits$Sex<-as.character(Traits$Sex)
+Traits$Sex<-as.numeric(Traits$Sex)
+
+colnames(Traits)<-c("Sex", "Age", "Diagnosis")
+
+#### 3. Regress out covariates #### 
+
+# The established covariates still need to be regressed out of the ME data, as has been done for the methylation data
+# Covariates to be regressed out: Cell type proportions and bisulfite batches (plate)
+
+MET<-t(MEs)
+
+# Function to regress out covariates
+RegrOut <- function( row, CD8T, CD4T, NK, Bcell, Mono,
+                     Plate1 , Plate2 , Plate3){
+  
+  residuals <- try (
+    resid(lm( row ~ CD8T+ CD4T+ NK+ Bcell+ Mono+ Plate1 + Plate2 + Plate3 ,na.action=na.exclude)),
+    silent=TRUE
+  )
+  if(inherits(residuals,'try-error')) return(rep(NA,ncol(MET)))
+  residuals
+} 
+
+# Apply model
+RegData  <- {
+  CD8T <- as.numeric(pheno[ colnames(MET), 'CD8T'])
+  CD4T <- as.numeric(pheno[ colnames(MET), 'CD4T'])
+  NK <- as.numeric(pheno[ colnames(MET), 'NK'])
+  Bcell <- as.numeric(pheno[ colnames(MET), 'Bcell'])
+  Mono <- as.numeric(pheno[ colnames(MET), 'Mono'])
+  Plate1 <-as.numeric(pheno[ colnames(MET), 'Plate1'])
+  Plate2 <-as.numeric(pheno[ colnames(MET), 'Plate2'])
+  Plate3 <-as.numeric(pheno[ colnames(MET), 'Plate3'])
+  
+  t( apply(MET, 1, RegrOut, CD8T, CD4T, NK, Bcell, Mono,
+           Plate1 , Plate2 , Plate3))
+}
+
+as.data.frame(t(RegData))->RegData.t
+
+
+#### 4. Outlier inspection ####
+
+# Inspect values within modules for possible outliers
+# Any values >5*sd will be set to NA
+
+# Add names of outliers and the relevant module to an overview table ####
+Overview<-data.frame(matrix(nrow=0,ncol=2))
+for (i in 1:ncol(MEs)){
+  module=colnames(MEs)[i]
+  
+  RegData.t[RegData.t[,module] < mean(RegData.t[,module],na.rm=T)-5*sd(RegData.t[,module],na.rm=T),module]->tes
+  if (length(tes)>0){ 
+      Overview<-rbind(Overview,c(rownames(RegData.t)[RegData.t[,module] %in% tes], module))
+    }
+  RegData.t[RegData.t[,module] > mean(RegData.t[,module],na.rm=T)+5*sd(RegData.t[,module],na.rm=T),module]->tes
+  if (length(tes)>0){ 
+    Overview<-rbind(Overview,c(rownames(RegData.t)[RegData.t[,module] %in% tes], module))
+  }
+}
+
+# Plot stripcharts for later inspection
+stripcharts<-function(module){
+  par(mfrow=c(1,1))
+  stripchart(RegData.t[ ,module], method="jitter",main=paste0(module, " Module Regressed Data"))
+  abline(v=c(mean(RegData.t[ ,module]) +2*sd(RegData.t[ ,module])), col="orange")
+  abline(v=c(mean(RegData.t[ ,module]) -2*sd(RegData.t[ ,module])), col="orange")
+  abline(v=c(mean(RegData.t[ ,module]) +5*sd(RegData.t[ ,module])), col="red")
+  abline(v=c(mean(RegData.t[ ,module]) -5*sd(RegData.t[ ,module])), col="red")
+  
+}
+
+ for (i in 1:ncol(RegData.t)){
+   stripcharts(colnames(RegData.t)[i])
+ }
+
+
+# Only 2 outliers; set to NA in specific modules
+RegData.t[Overview[1,1], Overview[1,2]]<-NA
+RegData.t[Overview[2,1], Overview[2,2]]<-NA
+
+# Plots following removal
+ 
+ for (i in 1:ncol(RegData.t)){
+   stripcharts(colnames(RegData.t)[i])
+ }
+
+
+#### 5. Module-Trait Correlations #####
+
+# Run an ANOVA interaction model on the MEs, as done for the main analysis in Chapter 4
+
+model <- function( row,Sex,Age, Diagnosis ){
+  
+  fit <- try (
+    lm( row ~ as.factor(Sex) + Age + as.factor(Diagnosis) + as.factor(Sex)*Age + as.factor(Sex)*as.factor(Diagnosis) + Age*as.factor(Diagnosis)),
+    silent=TRUE
+  )
+  results<-car::Anova(fit, type=3)
+  as.numeric(as.matrix(results[,c(3:4)]))
+  
+} 
+
+# Set cores for parallel processing 
+cores<-18
+cl<- makeCluster(cores)
+
+### Apply model
+
+results  <- {
+  Diagnosis   <- as.factor(pheno[ colnames(RegData), 'AtVisit_Group3'  ])
+  Sex   <- as.factor(pheno[ colnames(RegData), 'Sex'  ])
+  Age   <- as.numeric(pheno[ colnames(RegData), 'Age_At_Visit'  ])
+  
+  
+  t( parApply(cl,RegData, 1, model, Sex,Age,  Diagnosis ))
+}
+
+stopCluster(cl)
+fit<-lm(RegData[1, ] ~ as.factor(Sex) + Age + as.factor(Diagnosis) + 
+          as.factor(Sex) * Age + as.factor(Sex) * as.factor(Diagnosis) + 
+          Age * as.factor(Diagnosis))
+names<-rownames(car::Anova(fit,type=3))
+
+names<-c(paste0(names, ".F"), paste0(names, ".p"))
+names<-gsub("as.factor", '', names)
+names<-gsub("\\(", '', names)
+names<-gsub("\\)", '', names)
+colnames(results)<-names
+
+Cor<-results[,c(2:3,5:7)]
+Cor.p<-results[,c(10:11,13:15)]
+```
+```{r heatmap, echo=FALSE, warning=FALSE,message=FALSE, fig.height=7, fig.width=7}
+# Heatmap of correlations
+
+textMatrix = paste(signif(t(Cor), 2), "\n(",
+                   signif(t(Cor.p), 1), ")", sep = "");
+dim(textMatrix) = dim(t(Cor))
+par(mar = c(4,6,3,1));
+
+colfunc <- colorRampPalette(c("white", "indianred3"))
+labeledHeatmap(Matrix = Cor,
+               xLabels = gsub(".F", "",colnames(Cor)),
+               yLabels = colnames(RegData.t),
+               ySymbols = colnames(RegData.t),
+               colorLabels = T,
+               colors = colfunc(6),
+               textMatrix = t(textMatrix),
+               setStdMargins = FALSE,
+               cex.text = 0.7,
+               cex.lab = 0.7,
+               zlim = c(0,6),
+               main = paste("Module-trait relationships"))
+
+  
+```    
+  
+
+Modules showing a significant association to age: greenyellow, pink, green  
+Modules showing a significant association to sex x diagnosis: salmon   
+
+MM to PS correlations were calculated for these modules and traits:  
+
+```{r data, echo=FALSE, warning=FALSE,message=FALSE}
+
+#### 6. Calculate and correlate MM/PS for modules associated to traits ####
+# Assess whether probes central to a module, are also the ones driving the association with a trait
+
+# MM: correlate probe methylation to regressed out MEs, = pearson
+# PS: correlate probe methylation to trait of interest, = pearson for continuous, spearman for ordinal
+# Then perform pearson correlations between MM and PS
+Cor.p<-as.data.frame(Cor.p)
+
+
+
+### 6.1 Load Functions ####
+
+# MMPS plots function:
+# the function verboseScatterplot (for MMPS plots) is supposed to always calculate the pearson correlations,
+# but it actually shows spearman correlations. Have created a new function to create MMPS (full and top 15% MM) plots
+source("MMPSplot_function.R")
+
+# 1.2. MMPS correlations function
+source("MMPScor_function.R")
+
+### 6.2. Calculate Module Memberships ####
+
+dat.original <- dat
+data.dasen.regr <- t(data.dasen.regr)
+dat <- data.dasen.regr[,colnames(dat.original)]
+
+modNames = rownames(RegData)
+probeModuleMembership = as.data.frame(cor(dat, RegData.t, method="pearson",use = "pairwise.complete.obs"))
+
+# Wrote a new loop to calculate MM p-value, as original code corrected for total samples, not pairwise
+ for(o in 1:ncol(RegData.t)){
+   for (i in 1:ncol(dat)){
+     x<-cor.test(RegData.t[,o], dat[,i],method="pearson",use="pairwise.complete.obs")$p.value
+     if(i==1){
+       x->Pval.MM
+     } else{
+       Pval.MM<-cbind(Pval.MM,x)
+     }
+   }
+   if(o==1){
+     MMPvalue<-Pval.MM
+   }else{
+     MMPvalue<-rbind(MMPvalue,Pval.MM)
+   }
+ }
+ colnames(MMPvalue)<-colnames(dat)
+ rownames(MMPvalue)<-colnames(RegData.t)
+ t(MMPvalue)->MMPvalue
+
+
+names(probeModuleMembership) = paste("MM", modNames, sep="");
+names(MMPvalue) = paste("p.MM", modNames, sep="");
+
+
+### 6.3. Probe Significance: Age ####
+
+Trait = as.data.frame(pheno$Age_At_Visit);
+names(Trait) = "Age"
+
+probeTraitSignificance = as.data.frame(cor(dat, Trait, method="pearson", use = "pairwise.complete.obs"));
+PSPvalue <-as.data.frame(apply(dat,2, function(r) cor.test(r,Trait[,1],method="pearson",
+                                                           use="pairwise.complete.obs",exact=F)$p.value))
+colnames(PSPvalue)<-colnames(Trait)
+names(probeTraitSignificance) = paste("PS.", names(Trait), sep="");
+names(PSPvalue) = paste("p.PS.", names(Trait), sep="");
+
+
+# 3.2 Plot 
+
+MMPSplot("greenyellow", "chartreuse3")
+MMPSplot("pink", "deeppink2")
+MMPSplot("green", "green3")
+
+# 3.3 Correlate MM to PS
+
+MMPScor("greenyellow")
+MMPScor("pink")
+MMPScor("green")
+
+### 6.4. Probe Significance: Sex*Diagnosis ####
+
+pheno$Sex<-as.character(pheno$Sex)
+pheno$Sex<-as.numeric(pheno$Sex)
+pheno$SexDiag<- c(pheno$Sex *pheno$AtVisit_Group3)
+Trait = as.data.frame(pheno$SexDiag);
+names(Trait) = "Sex*Diagnosis"
+
+
+probeTraitSignificance = as.data.frame(cor(dat, Trait, method="spearman", use = "pairwise.complete.obs"));
+PSPvalue <-as.data.frame(apply(dat,2, function(r) cor.test(r,Trait[,1],method="spearman",
+                                                           use="pairwise.complete.obs",exact=F)$p.value))
+colnames(PSPvalue)<-colnames(Trait)
+names(probeTraitSignificance) = paste("PS.", names(Trait), sep="");
+names(PSPvalue) = paste("p.PS.", names(Trait), sep="");
+
+
+# 3.2 Plot 
+
+MMPSplot("salmon")
+
+# 3.3 Correlate MM to PS
+
+MMPScor("salmon")
+
+	
+```
+  
+A table of MM to PS correlations:  
+```{r MMPS, echo=FALSE}
+kable(MMPScorrelation)%>%
+  kable_styling(fixed_thead = T, bootstrap_options = c("striped"," hover"))
+```  
+
+# Pathway analyses:  
+Pathway analyses have been run for the green, greenyellow, pink and salmon modules.
+Plots are automatically generated below if there are any FDR-significant pathways.
+
+
+
+```{r pathwaysGreen, echo=FALSE, warning=FALSE,message=FALSE}
+
+t(dat)->dat
+names(moduleColors)<-rownames(dat)
+
+
+#### green all ####
+colour<- "green"
+
+# Specify project name to be appended to file names
+projectName <- paste0(colour," module")
+
+## Load required packages / functions
+source("/mnt/data1/Janou/References/crystalmeth_fun.R")
+read.csv(paste0("Pathways/", colour," GO Gene Analysis Output WGCNA_fullbg.csv"))->go
+read.csv(paste0("Pathways/", colour," KEGG Gene Analysis Output WGCNA_fullbg.csv"))->kegg
+# Plots
+
+topplotGO<-function(Top, Title){
+  Top$order<-c(1:nrow(Top))
+  Top$qvalue<-as.numeric(scientific(Top$FDR))
+
+  ggplot(Top, aes_string(x = reorder(Top$Term, -Top$order), y = Top$DE,
+                       fill = Top$qvalue))  + scale_fill_continuous(low = "red", 
+                                                                    high = "blue", name = "FDR-value", guide = guide_colorbar(reverse = TRUE))+
+  geom_bar(stat="identity")+coord_flip()+xlab(NULL)+ylab(NULL)+theme_bw()+
+  ggtitle(paste0("GO Terms in ", Title ))
+}
+
+
+topplotKEGG<-function(Top, Title){
+Top$order<-c(1:nrow(Top))
+Top$qvalue<-as.numeric(scientific(Top$FDR))
+
+ggplot(Top, aes_string(x = reorder(Top$desc, -Top$order), y = Top$DE,
+                       fill = Top$qvalue))  + scale_fill_continuous(low = "red", 
+                                                                    high = "blue", name = "FDR-value", guide = guide_colorbar(reverse = TRUE))+
+  geom_bar(stat="identity")+coord_flip()+xlab(NULL)+ylab(NULL)+theme_bw()+
+  ggtitle(paste0("KEGG Terms in ",Title))
+
+}
+
+Title<-projectName
+if(length(go[go$FDR<0.05,1])>0 & length(go[go$FDR<0.05,1])<=20){
+    Top<-go[go$FDR<0.05,]
+    topplotGO(Top,Title)
+} else if(length(go[go$FDR<0.05,1])>20) {
+  Top<-go[1:20,]
+  topplotGO(Top,Title)
+}
+
+if(length(kegg[kegg$FDR<0.05,1])>0 & length(kegg[kegg$FDR<0.05,1])<=20){
+  Top<-kegg[kegg$FDR<0.05,]
+topplotKEGG(Top,Title)
+} else if(length(kegg[kegg$FDR<0.05,1])>20) {
+  Top<-kegg[1:20,]
+  topplotKEGG(Top,Title)
+}
+``` 
+  
+
+Number of GO terms FDR-significant in the `r colour` module: `r sum(go$FDR < 0.05)`.  
+Number of KEGG terms FDR-significant in the `r colour` module: `r sum(kegg$FDR < 0.05)`.  
+
+  
+```{r pathwaysGY, echo=FALSE, warning=FALSE,message=FALSE}
+#### greenyellow all ####
+colour<- "greenyellow"
+
+# Specify project name to be appended to file names
+projectName <- paste0(colour," module")
+
+read.csv(paste0("Pathways/", colour," GO Gene Analysis Output WGCNA_fullbg.csv"))->go
+read.csv(paste0("Pathways/", colour," KEGG Gene Analysis Output WGCNA_fullbg.csv"))->kegg
+
+Title<-projectName
+if(length(go[go$FDR<0.05,1])>0 & length(go[go$FDR<0.05,1])<=20){
+    Top<-go[go$FDR<0.05,]
+    topplotGO(Top,Title)
+} else if(length(go[go$FDR<0.05,1])>20) {
+  Top<-go[1:20,]
+  topplotGO(Top,Title)
+}
+
+if(length(kegg[kegg$FDR<0.05,1])>0 & length(kegg[kegg$FDR<0.05,1])<=20){
+  Top<-kegg[kegg$FDR<0.05,]
+topplotKEGG(Top,Title)
+} else if(length(kegg[kegg$FDR<0.05,1])>20) {
+  Top<-kegg[1:20,]
+  topplotKEGG(Top,Title)
+}
+```
+  
+Number of GO terms FDR-significant in the `r colour` module: `r sum(go$FDR < 0.05)`.  
+Number of KEGG terms FDR-significant in the `r colour` module: `r sum(kegg$FDR < 0.05)`.  
+
+```{r pathwaysPink, echo=FALSE, warning=FALSE,message=FALSE}
+#### pink all ####
+colour<- "pink"
+
+
+# Specify project name to be appended to file names
+projectName <- paste0(colour," module")
+
+read.csv(paste0("Pathways/", colour," GO Gene Analysis Output WGCNA_fullbg.csv"))->go
+read.csv(paste0("Pathways/", colour," KEGG Gene Analysis Output WGCNA_fullbg.csv"))->kegg
+
+
+Title<-projectName
+if(length(go[go$FDR<0.05,1])>0 & length(go[go$FDR<0.05,1])<=20){
+    Top<-go[go$FDR<0.05,]
+    topplotGO(Top,Title)
+} else if(length(go[go$FDR<0.05,1])>20) {
+  Top<-go[1:20,]
+  topplotGO(Top,Title)
+}
+
+if(length(kegg[kegg$FDR<0.05,1])>0 & length(kegg[kegg$FDR<0.05,1])<=20){
+  Top<-kegg[kegg$FDR<0.05,]
+topplotKEGG(Top,Title)
+} else if(length(kegg[kegg$FDR<0.05,1])>20) {
+  Top<-kegg[1:20,]
+  topplotKEGG(Top,Title)
+}
+```
+   
+Number of GO terms FDR-significant in the `r colour` module: `r sum(go$FDR < 0.05)`.  
+Number of KEGG terms FDR-significant in the `r colour` module: `r sum(kegg$FDR < 0.05)`.  
+
+```{r pathwaysSal, echo=FALSE, warning=FALSE,message=FALSE}
+#### salmon all ####
+colour<- "salmon"
+
+# Specify project name to be appended to file names
+projectName <- paste0(colour," module Sex*Diagnosis")
+
+
+read.csv(paste0("Pathways/", colour," GO Gene Analysis Output WGCNA_fullbg.csv"))->go
+read.csv(paste0("Pathways/", colour," KEGG Gene Analysis Output WGCNA_fullbg.csv"))->kegg
+
+Title<-projectName
+if(length(go[go$FDR<0.05,1])>0 & length(go[go$FDR<0.05,1])<=20){
+    Top<-go[go$FDR<0.05,]
+    topplotGO(Top,Title)
+} else if(length(go[go$FDR<0.05,1])>20) {
+  Top<-go[1:20,]
+  topplotGO(Top,Title)
+}
+
+if(length(kegg[kegg$FDR<0.05,1])>0 & length(kegg[kegg$FDR<0.05,1])<=20){
+  Top<-kegg[kegg$FDR<0.05,]
+topplotKEGG(Top,Title)
+} else if(length(kegg[kegg$FDR<0.05,1])>20) {
+  Top<-kegg[1:20,]
+  topplotKEGG(Top,Title)
+}
+
+
+```
+
+   
+Number of GO terms FDR-significant in the `r colour` module: `r sum(go$FDR < 0.05)`.  
+Number of KEGG terms FDR-significant in the `r colour` module: `r sum(kegg$FDR < 0.05)`.  
