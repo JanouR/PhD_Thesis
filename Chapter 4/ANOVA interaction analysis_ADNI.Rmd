@@ -1,0 +1,394 @@
+---
+title: "Interaction analysis in ADNI"
+author: "Janou Roubroeks"
+output: 
+ html_document:
+  toc: true
+  toc_float: false
+  number_sections: false
+---
+
+ ```{css, echo=FALSE}
+    body .main-container {
+      max-width: 1800px !important;
+      margin-left: auto !important;
+      margin-right: auto !important;
+    }
+    body {
+      max-width: 1800px !important;
+      margin-left: auto !important;
+      margin-right: auto !important;
+    }
+    ```
+    
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+wd<-""
+packages<-c("wateRmelon", "dplyr", "qqman","kableExtra", "bacon","car")
+setwd(wd)
+lapply(packages, library, character.only=T) 
+
+# Create a folder for storing output plots
+if(!dir.exists(paste0(wd,"Plots"))){
+  dir.create(paste0(wd,"Plots"))
+}
+
+if(!dir.exists(paste0(wd,"Combp"))){
+  dir.create(paste0(wd,"Combp"))
+}
+```
+
+# Interaction analysis - model  
+
+This analysis of sex, age, diagnosis, and the interactions between these variables in the ADNI dataset follows the model that was previously run on the AddNeuroMed data:
+
+```{r model, eval=FALSE}
+lm(methylation ~ sex + age + diagnosis + age * sex + diagnosis * sex + age * diagnosis)
+```
+
+Packages used in this analysis: `r packages`.  
+Results from this analysis are stored in "`r wd`".  
+
+
+```{r data, echo=FALSE}
+load("") # Load DNA methylation data (normalised)
+Anno<-read.csv("", skip=7)
+data<-betas(data.dasen)
+
+Anno<-Anno[match(rownames(data), Anno$Name),]
+rownames(Anno) <-Anno$IlmnID
+	
+```
+
+# Regression results {.tabset} 
+
+
+```{r Regression, echo=FALSE, warning=FALSE, message=FALSE}
+# Regress out covariates 
+
+# Function
+RegrOut <- function( row,CD8T, CD4T, NK, Bcell, Mono){
+  
+  residuals <- try (
+    resid(lm( row ~ CD8T+ CD4T+ NK+ Bcell+ Mono ,na.action=na.exclude)),
+    silent=TRUE
+  )
+  residuals
+} 
+
+
+# Set cores for parallel processing 
+cores<-32
+cl<- makeCluster(cores)
+
+### Apply model
+RegData  <- {
+  CD8T <- as.numeric(pheno[ colnames(data), 'CD8T'])
+  CD4T <- as.numeric(pheno[ colnames(data), 'CD4T'])
+  NK <- as.numeric(pheno[ colnames(data), 'NK'])
+  Bcell <- as.numeric(pheno[ colnames(data), 'Bcell'])
+  Mono <- as.numeric(pheno[ colnames(data), 'Mono'])
+  
+  t( parApply(cl, data, 1, RegrOut,CD8T, CD4T, NK, Bcell, Mono))
+}
+
+stopCluster(cl)
+
+
+save(RegData, file="Regressed out data.RData")
+
+
+# ANOVA
+
+model <- function( row,Sex,Age, Diagnosis ){
+  
+  fit <- try (
+    lm( row ~ as.factor(Sex) + Age + as.factor(Diagnosis) + as.factor(Sex)*Age + as.factor(Sex)*as.factor(Diagnosis) + Age*as.factor(Diagnosis)),
+    silent=TRUE
+  )
+  results<-car::Anova(fit, type=3)
+  as.numeric(as.matrix(results[,c(3:4)]))
+  
+ } 
+
+# Set cores for parallel processing 
+cores<-32
+cl<- makeCluster(cores)
+
+### Apply model
+
+results  <- {
+  Diagnosis   <- as.factor(pheno[ colnames(RegData), 'Diagnosis'  ])
+  Sex   <- as.factor(pheno[ colnames(RegData), 'Sex'  ])
+  Age   <- as.numeric(pheno[ colnames(RegData), 'Age'  ])
+ 
+  
+  t( parApply(cl,RegData, 1, model, Sex,Age,  Diagnosis ))
+}
+
+stopCluster(cl)
+fit<-lm(RegData[1, ] ~ as.factor(Sex) + Age + as.factor(Diagnosis) + 
+    as.factor(Sex) * Age + as.factor(Sex) * as.factor(Diagnosis) + 
+    Age * as.factor(Diagnosis))
+names<-rownames(car::Anova(fit,type=3))
+
+
+names<-c(paste0(names, ".F"), paste0(names, ".p"))
+names<-gsub("as.factor", '', names)
+names<-gsub("\\(", '', names)
+names<-gsub("\\)", '', names)
+colnames(results)<-names
+
+### Add annotation to model
+
+rownames(Anno)<- Anno$IlmnID
+Anno <-Anno[rownames(results), ]
+merge(results, Anno, by="row.names") -> lm_Anno
+rownames(lm_Anno)<- lm_Anno$Row.names
+
+
+# save results
+save(lm_Anno,results, file="Results Interaction.RData")
+
+######## Create tables for publication #
+lm_Anno$Position<- paste0("chr ",lm_Anno$CHR,": ", lm_Anno$MAPINFO)
+lmRed<-lm_Anno[,c(1,grep("Position", colnames(lm_Anno)),
+                  grep("Age|Sex", colnames(lm_Anno)),
+                  grep("UCSC_RefGene_Name$|UCSC_RefGene_Group$|Relation_to_UCSC_CpG_Island$", colnames(lm_Anno)))]
+colnames(lmRed)[c(1,c(ncol(lmRed)-2): ncol(lmRed))]<-c("ProbeID",
+                   "UCSC Gene", "UCSC Gene Group","UCSC Gene Relation to CpG Island")
+
+colnames(lmRed)<-gsub(":", ".", colnames(lmRed))
+
+
+write.csv(lmRed[order(lmRed$Sex.p)[1:1000],], "Top1000 Sex.csv")
+write.csv(lmRed[order(lmRed$Age.p)[1:1000],], "Top1000 Age.csv")
+write.csv(lmRed[order(lmRed$`Sex.Age.p`)[1:1000],], "Top1000 SexAge.csv")
+write.csv(lmRed[order(lmRed$`Sex.Diagnosis.p`)[1:1000],], "Top1000 SexDiag.csv")
+write.csv(lmRed[order(lmRed$`Age.Diagnosis.p`)[1:1000],], "Top1000 AgeDiag.csv")
+
+######## Create files for comb-p ########
+
+DMRinput <- function(results,  chr = "CHR", 
+                     mapinfo = "MAPINFO", p = "P"){
+  dmr <- data.frame("chrom" = paste0("chr", as.character(results[ , chr])),
+                    "start" = results[, mapinfo],
+                    "end" = results[, mapinfo] + 1,
+                    "pvalue" = results[ , p])
+  dmr <- summarise(group_by(dmr, chrom, start), end = end, pvalue = pvalue)
+  colnames(dmr) <- c("#chrom", "start", "end", "pvalue")
+  return(dmr)
+}
+
+sex<-DMRinput(lm_Anno, p="Sex.p")
+age<-DMRinput(lm_Anno, p="Age.p")
+sexage<-DMRinput(lm_Anno, p="Sex:Age.p")
+sexdiag<-DMRinput(lm_Anno, p="Sex:Diagnosis.p")
+agediag<-DMRinput(lm_Anno, p="Age:Diagnosis.p")
+
+write.table(sex, file = "./Combp/Sex_DMRinput.bed", sep = "\t", row.names = FALSE, col.names = T, quote = FALSE)
+write.table(age, file = "./Combp/Age_DMRinput.bed", sep = "\t", row.names = FALSE, col.names = T, quote = FALSE)
+write.table(sexage, file = "./Combp/SexAge_DMRinput.bed", sep = "\t", row.names = FALSE, col.names = T, quote = FALSE)
+write.table(sexdiag, file = "./Combp/SexDiag_DMRinput.bed", sep = "\t", row.names = FALSE, col.names = T, quote = FALSE)
+write.table(agediag, file = "./Combp/AgeDiag_DMRinput.bed", sep = "\t", row.names = FALSE, col.names = T, quote = FALSE)
+
+# Prepare data for making tables below: 
+sa<-grep("Sex.A", colnames(lmRed))
+sd1<-grep("Sex.Diagnosis", colnames(lmRed))
+
+ad1<-grep("Age.Diagnosis", colnames(lmRed))
+
+int<-c(sa,sd1,ad1)
+sex<-grep("Sex", colnames(lmRed))[!grep("Sex", colnames(lmRed)) %in% int]
+age<-grep("Age", colnames(lmRed))[!grep("Age", colnames(lmRed)) %in% int]
+anno<-grep("UCSC Gene$|UCSC Gene Group$|UCSC Gene Relation to CpG Island$",colnames(lmRed))
+all<-c(sex,age,int)
+st<-grep("ProbeID$|Position", colnames(lmRed))
+```
+
+## Sex:
+
+Number of probes significantly associated with sex, passing the experiment wide threshold (2.4x10-7): `r nrow(lmRed[lmRed$Sex.p<2.4E-7,])`.  
+*The top 50 sex associated DMPs:*  
+  
+```{r Top10sex, echo=FALSE}
+
+
+
+lmRed<- lmRed[order(lmRed$Sex.p),]
+select<-lmRed[1:50,c(st,sex,anno,all[!all %in% sex])]
+rownames(select)<-NULL
+
+for(c in grep("\\.", colnames(select))){
+     for(i in 1:nrow(select)){
+         if(abs(as.numeric(select[i,c]))>0.001){
+             select[i,c]<-as.numeric(round(as.numeric(select[i,c]),3))
+         } else {
+             select[i,c]<- formatC(as.numeric(select[i,c]),format="e",digits=2)
+         }}}
+
+kable(select) %>%
+  kable_styling(fixed_thead = T, bootstrap_options = c("striped"," hover")) %>%
+scroll_box(width = "1000px", height = "500px")
+```
+
+## Age:  
+Number of probes significantly associated with age, passing the experiment wide threshold (2.4x10-7): `r nrow(lmRed[lmRed$Age.p <2.4E-7,])`.  
+  
+*The top 50 age associated DMPs:*
+
+```{r Top10age, echo=FALSE}
+
+lmRed<- lmRed[order(lmRed$Age.p),]
+
+select<-lmRed[1:50,c(st,age,anno,all[!all %in% age])]
+rownames(select)<-NULL
+
+for(c in grep("\\.", colnames(select))){
+     for(i in 1:nrow(select)){
+         if(abs(as.numeric(select[i,c]))>0.001){
+             select[i,c]<-as.numeric(round(as.numeric(select[i,c]),3))
+         } else {
+             select[i,c]<- formatC(as.numeric(select[i,c]),format="e",digits=2)
+         }}}
+
+kable(select) %>%
+  kable_styling(fixed_thead = T, bootstrap_options = c("striped"," hover")) %>%
+scroll_box(width = "1000px", height = "500px")
+```
+
+## Interaction terms: {.tabset}
+
+### Sex x Age:
+
+Number of probes showing a significant interaction effect of sex and age, passing the experiment wide threshold (2.4x10-7): `r nrow(lmRed[lmRed$Sex.Age.p<2.4E-7,])`.
+
+*The top 50 sex x age associated DMPs:*    
+
+```{r Top10sexage1, echo=FALSE}
+
+lmRed<- lmRed[order(lmRed$Sex.Age.p),]
+
+select<-lmRed[1:50,c(st,sa,anno,all[!all %in% sa])]
+rownames(select)<-NULL
+
+
+for(c in grep("\\.", colnames(select))){
+     for(i in 1:nrow(select)){
+         if(abs(as.numeric(select[i,c]))>0.001){
+             select[i,c]<-as.numeric(round(as.numeric(select[i,c]),3))
+         } else {
+             select[i,c]<- formatC(as.numeric(select[i,c]),format="e",digits=2)
+         }}}
+
+kable(select) %>%
+  kable_styling(fixed_thead = T, bootstrap_options = c("striped"," hover")) %>%
+scroll_box(width = "1000px", height = "500px")
+```
+  
+### Sex x Diagnosis
+
+Number of probes showing a significant interaction effect of sex and diagnosis, passing the experiment wide threshold (2.4x10-7): `r nrow(lmRed[lmRed$Sex.Diagnosis.p<2.4E-7,])`.
+
+*The top 50 sex x diagnosis associated DMPs:*    
+
+```{r Top10sexdiag1, echo=FALSE}
+type<-sd1
+lmRed<- lmRed[order(lmRed$Sex.Diagnosis.p),]
+
+
+select<-lmRed[1:50,c(st,type,anno,all[!all %in% type])]
+rownames(select)<-NULL
+
+
+for(c in grep("\\.", colnames(select))){
+     for(i in 1:nrow(select)){
+         if(abs(as.numeric(select[i,c]))>0.001){
+             select[i,c]<-as.numeric(round(as.numeric(select[i,c]),3))
+         } else {
+             select[i,c]<- formatC(as.numeric(select[i,c]),format="e",digits=2)
+         }}}
+
+kable(select) %>%
+  kable_styling(fixed_thead = T, bootstrap_options = c("striped"," hover")) %>%
+scroll_box(width = "1000px", height = "500px")
+```
+
+
+### Age x Diagnosis
+
+Number of probes showing a significant interaction effect of age and diagnosis, passing the experiment wide threshold (2.4x10-7): `r nrow(lmRed[lmRed$Age.Diagnosis.p<2.4E-7,])`. 
+
+*The top 50 age x diagnosis associated DMPs:*    
+
+```{r Top10agediag1, echo=FALSE}
+type<-ad1
+lmRed<- lmRed[order(lmRed$Age.Diagnosis.p),]
+
+
+select<-lmRed[1:50,c(st,type,anno,all[!all %in% type])]
+rownames(select)<-NULL
+
+
+for(c in grep("\\.", colnames(select))){
+     for(i in 1:nrow(select)){
+         if(abs(as.numeric(select[i,c]))>0.001){
+             select[i,c]<-as.numeric(round(as.numeric(select[i,c]),3))
+         } else {
+             select[i,c]<- formatC(as.numeric(select[i,c]),format="e",digits=2)
+         }}}
+
+kable(select) %>%
+  kable_styling(fixed_thead = T, bootstrap_options = c("striped"," hover")) %>%
+scroll_box(width = "1000px", height = "500px")
+```
+
+
+
+# Inflation check {.tabset}
+
+As both sex and age have large effects on DNA methylation, there may be some inflation of p-values. This can be inspected in QQ-plots of p-values and calculated lambda values as a measure of inflation.  
+
+```{r QQplots,echo=FALSE}
+as.data.frame(results)->results
+colnames(results)<-gsub(":", ".", colnames(results))
+
+qq(results$Sex.p, main = expression(paste('Q-Q plot of Sex ',italic('p'), '-values')),
+   sub = paste0("Lambda: ", round( median(qchisq(1-results$Sex.p,1))/qchisq(0.5,1), 3)))
+
+pdf("Plots/QQplots main Sex.pdf")
+qq(results$Sex.p, main = expression(paste('Q-Q plot of Sex ',italic('p'), '-values')),
+   sub = paste0("Lambda: ", round( median(qchisq(1-results$Sex.p,1))/qchisq(0.5,1), 3)))
+invisible(dev.off())
+
+qq(results$Age.p, main = expression(paste('Q-Q plot of Age ',italic('p'), '-values')),
+   sub = paste0("Lambda: ", round( median(qchisq(1-results$Age.p,1))/qchisq(0.5,1), 3)))
+pdf("Plots/QQplots main Age.pdf")
+qq(results$Age.p, main = expression(paste('Q-Q plot of Age ',italic('p'), '-values')),
+   sub = paste0("Lambda: ", round( median(qchisq(1-results$Age.p,1))/qchisq(0.5,1), 3)))
+invisible(dev.off())
+
+qq(results$Sex.Age.p, main = expression(paste('Q-Q plot of Sex*Age ',italic('p'), '-values')),
+   sub = paste0("Lambda: ", round( median(qchisq(1-results$Sex.Age.p,1))/qchisq(0.5,1), 3)))
+pdf("Plots/QQplots int SexAge.pdf")
+qq(results$Sex.Age.p, main = expression(paste('Q-Q plot of Sex*Age ',italic('p'), '-values')),
+   sub = paste0("Lambda: ", round( median(qchisq(1-results$Sex.Age.p,1))/qchisq(0.5,1), 3)))
+invisible(dev.off())
+
+qq(results$Sex.Diagnosis.p, main = expression(paste('Q-Q plot of Sex*Diagnosis ',italic('p'), '-values')),
+   sub = paste0("Lambda: ", round( median(qchisq(1-results$Sex.Diagnosis.p,1))/qchisq(0.5,1), 3)))
+
+pdf("Plots/QQplots int SexDiag.pdf")
+qq(results$Sex.Diagnosis.p, main = expression(paste('Q-Q plot of Sex*Diagnosis ',italic('p'), '-values')),
+   sub = paste0("Lambda: ", round( median(qchisq(1-results$Sex.Diagnosis.p,1))/qchisq(0.5,1), 3)))
+invisible(dev.off())
+
+
+qq(results$Age.Diagnosis.p, main = expression(paste('Q-Q plot of Age*Diagnosis ',italic('p'), '-values')),
+   sub = paste0("Lambda: ", round( median(qchisq(1-results$Age.Diagnosis.p,1))/qchisq(0.5,1), 3)))
+pdf("Plots/QQplots int AgeDiag.pdf")
+qq(results$Age.Diagnosis.p, main = expression(paste('Q-Q plot of Age*Diagnosis ',italic('p'), '-values')),
+   sub = paste0("Lambda: ", round( median(qchisq(1-results$Age.Diagnosis.p,1))/qchisq(0.5,1), 3)))
+invisible(dev.off())
+```
